@@ -88,6 +88,9 @@ def main():
     parser.add_argument('--outf', default='unify', help='folder to output images and model checkpoints')
     parser.add_argument('--suffix', default='', help="suffix str for outf")
 
+    # lightfield
+    parser.add_argument('--grid_size', default=9)
+
 
     args = parser.parse_args()
     torch.set_printoptions(precision=4) 
@@ -143,7 +146,7 @@ def train(local_rank, args):
             rank=local_rank,
         )
         torch.cuda.set_device(local_rank)
-        assert torch.distributed.is_initialized()        
+        assert torch.distributed.is_initialized()
         args.batchSize = int(args.batchSize / args.ngpus_per_node)
 
     args.metric_names = ['pred_seen_psnr', 'pred_seen_ssim', 'pred_unseen_psnr', 'pred_unseen_ssim',
@@ -241,6 +244,7 @@ def train(local_rank, args):
     if not args.not_resume:
         checkpoint_path = os.path.join(args.outf, 'model_latest.pth')
         if os.path.isfile(checkpoint_path):
+            print(checkpoint_path)
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             model.load_state_dict(checkpoint['state_dict'])
             print("=> Auto resume loaded checkpoint '{}' (epoch {})".format(checkpoint_path, checkpoint['epoch']))
@@ -282,6 +286,8 @@ def train(local_rank, args):
         device = next(model.parameters()).device
         for i, sample in enumerate(train_dataloader):
             img_data, norm_idx, img_idx = data_to_gpu(sample['img'], device), data_to_gpu(sample['norm_idx'], device), data_to_gpu(sample['idx'], device)
+            y, x = data_to_gpu(sample['y'], device), data_to_gpu(sample['x'], device)
+
             if i > 10 and args.debug:
                 break
 

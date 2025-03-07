@@ -21,15 +21,45 @@ import glob
 
 # Video dataset
 class VideoDataSet(Dataset):
+    # def __init__(self, args):
+    #     if os.path.isfile(args.data_path):
+    #         self.video = decord.VideoReader(args.data_path)
+    #     else:
+    #         self.video = [os.path.join(args.data_path, x) for x in sorted(os.listdir(args.data_path))]
+
+    #     # Resize the input video and center crop
+    #     self.crop_list, self.resize_list = args.crop_list, args.resize_list
+    #     # import pdb; pdb.set_trace; from IPython import embed; embed()     
+    #     first_frame = self.img_transform(self.img_load(0))
+    #     self.final_size = first_frame.size(-2) * first_frame.size(-1)
+    
     def __init__(self, args):
+        self.grid_size = args.grid_size
+
         if os.path.isfile(args.data_path):
             self.video = decord.VideoReader(args.data_path)
         else:
-            self.video = [os.path.join(args.data_path, x) for x in sorted(os.listdir(args.data_path))]
+            subfolders = sorted(os.listdir(args.data_path))
+            self.video = []
+            
+            # 첫 번째 폴더의 이미지 개수를 확인
+            first_folder = os.path.join(args.data_path, subfolders[0])
+            first_folder_images = sorted(glob.glob(os.path.join(first_folder, '*.png')))
+            expected_frame_count = len(first_folder_images)
+            self.frame_num = expected_frame_count
+            
+            # 모든 하위 폴더를 순회하며 이미지 경로 추가
+            for folder in subfolders:
+                folder_path = os.path.join(args.data_path, folder)
+                if os.path.isdir(folder_path):
+                    images = sorted(glob.glob(os.path.join(folder_path, '*.png')))
+                    if len(images) != expected_frame_count:
+                        raise ValueError(f"폴더 {folder}의 이미지 개수({len(images)})가 첫 번째 폴더의 이미지 개수({expected_frame_count})와 다릅니다.")
+                    self.video.extend(images)
 
         # Resize the input video and center crop
         self.crop_list, self.resize_list = args.crop_list, args.resize_list
-        # import pdb; pdb.set_trace; from IPython import embed; embed()     
+        # import pdb; pdb.set_trace; from IPython import embed; embed()
         first_frame = self.img_transform(self.img_load(0))
         self.final_size = first_frame.size(-2) * first_frame.size(-1)
 
@@ -41,7 +71,7 @@ class VideoDataSet(Dataset):
         return img / 255.
 
     def img_transform(self, img):
-        if self.crop_list != '-1': 
+        if self.crop_list != '-1':
             crop_h, crop_w = [int(x) for x in self.crop_list.split('_')[:2]]
             if 'last' not in self.crop_list:
                 img = center_crop(img, (crop_h, crop_w))
@@ -61,8 +91,14 @@ class VideoDataSet(Dataset):
 
     def __getitem__(self, idx):
         tensor_image = self.img_transform(self.img_load(idx))
-        norm_idx = float(idx) / len(self.video)
-        sample = {'img': tensor_image, 'idx': idx, 'norm_idx': norm_idx}
+        
+        pos = idx // self.frame_num
+        frame = idx % self.frame_num
+        y = float(pos // self.grid_size) / self.grid_size
+        x = float(pos % self.grid_size) / self.grid_size
+        
+        norm_idx = float(frame) / self.frame_num
+        sample = {'img': tensor_image, 'idx': frame, 'norm_idx': norm_idx, 'y': y, 'x': x}
         
         return sample
 
@@ -136,7 +172,7 @@ class HNeRV(nn.Module):
         decoder_layer1 = NeRVBlock(dec_block=False, conv_type='conv', ngf=ch_in, new_ngf=out_f, ks=0, strd=1, 
             bias=True, norm=args.norm, act=args.act)
         decoder_layers.append(decoder_layer1)
-        for i, strd in enumerate(args.dec_strds):                         
+        for i, strd in enumerate(args.dec_strds):
             reduction = sqrt(strd) if args.reduce==-1 else args.reduce
             new_ngf = int(max(round(ngf / reduction), args.lower_width))
             for j in range(dec_blks):
@@ -146,7 +182,7 @@ class HNeRV(nn.Module):
                 ngf = new_ngf
         
         self.decoder = nn.ModuleList(decoder_layers)
-        self.head_layer = nn.Conv2d(ngf, 3, 3, 1, 1) 
+        self.head_layer = nn.Conv2d(ngf, 3, 3, 1, 1)
         self.out_bias = args.out_bias
 
     def forward(self, input, input_embed=None, encode_only=False):
@@ -189,7 +225,7 @@ class HNeRVDecoder(nn.Module):
         n, c, h, w = output.shape
         output = output.view(n, -1, self.fc_h, self.fc_w, h, w).permute(0,1,4,2,5,3).reshape(n,-1,self.fc_h * h, self.fc_w * w)
         for layer in self.decoder[1:]:
-            output = layer(output) 
+            output = layer(output)
         output = self.head_layer(output)
 
         return  OutImg(output, self.out_bias)
