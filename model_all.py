@@ -42,13 +42,11 @@ class VideoDataSet(Dataset):
             subfolders = sorted(os.listdir(args.data_path))
             self.video = []
             
-            # 첫 번째 폴더의 이미지 개수를 확인
             first_folder = os.path.join(args.data_path, subfolders[0])
             first_folder_images = sorted(glob.glob(os.path.join(first_folder, '*.png')))
             expected_frame_count = len(first_folder_images)
             self.frame_num = expected_frame_count
             
-            # 모든 하위 폴더를 순회하며 이미지 경로 추가
             for folder in subfolders:
                 folder_path = os.path.join(args.data_path, folder)
                 if os.path.isdir(folder_path):
@@ -98,7 +96,7 @@ class VideoDataSet(Dataset):
         x = float(pos % self.grid_size) / self.grid_size
         
         norm_idx = float(frame) / self.frame_num
-        sample = {'img': tensor_image, 'idx': frame, 'norm_idx': norm_idx, 'y': y, 'x': x}
+        sample = {'img': tensor_image, 'idx': frame, 'norm_idx': norm_idx, 'norm_y': y, 'norm_x': x}
         
         return sample
 
@@ -160,7 +158,7 @@ class HNeRV(nn.Module):
             self.fc_h, self.fc_w = hnerv_hw, hnerv_hw
             ch_in = enc_dim2
         else:
-            ch_in = 2 * int(args.embed.split('_')[-1])
+            ch_in = 2 * int(args.embed.split('_')[-1]) * 3
             self.pe_embed = PositionEncoding(args.embed)  
             self.encoder = nn.Identity()
             self.fc_h, self.fc_w = [int(x) for x in args.fc_hw.split('_')]
@@ -190,7 +188,7 @@ class HNeRV(nn.Module):
             img_embed = input_embed
         else:
             if 'pe' in self.embed:
-                input = self.pe_embed(input[:,None]).float()
+                input = self.pe_embed(input).float()
             img_embed = self.encoder(input)
 
         # import pdb; pdb.set_trace; from IPython import embed; embed()     
@@ -242,8 +240,16 @@ class PositionEncoding(nn.Module):
 
     def forward(self, pos):
         if 'pe' in self.pe_embed:
-            value_list = pos * self.pe_bases.to(pos.device)
-            pe_embed = torch.cat([torch.sin(value_list), torch.cos(value_list)], dim=-1)
+            # pos는 이제 [batch_size, 3] 형태로 들어옵니다 (norm_y, norm_x, norm_idx)
+            # 각 위치 값에 대해 개별적으로 인코딩을 적용합니다
+            pe_embeds = []
+            for i in range(pos.size(1)):  # 각 차원(y, x, idx)에 대해 반복
+                value_list = pos[:, i:i+1] * self.pe_bases.to(pos.device)
+                cur_pe_embed = torch.cat([torch.sin(value_list), torch.cos(value_list)], dim=-1)
+                pe_embeds.append(cur_pe_embed)
+            
+            # 모든 인코딩을 합칩니다
+            pe_embed = torch.cat(pe_embeds, dim=1)
             return pe_embed.view(pos.size(0), -1, 1, 1)
         else:
             return pos

@@ -286,14 +286,23 @@ def train(local_rank, args):
         device = next(model.parameters()).device
         for i, sample in enumerate(train_dataloader):
             img_data, norm_idx, img_idx = data_to_gpu(sample['img'], device), data_to_gpu(sample['norm_idx'], device), data_to_gpu(sample['idx'], device)
-            y, x = data_to_gpu(sample['y'], device), data_to_gpu(sample['x'], device)
+            norm_y, norm_x = data_to_gpu(sample['norm_y'], device), data_to_gpu(sample['norm_x'], device)
 
             if i > 10 and args.debug:
                 break
 
             # forward and backward
             img_data, img_gt, inpaint_mask = args.transform_func(img_data)
-            cur_input = norm_idx if 'pe' in args.embed else img_data
+            
+            # 차원 추가 후 concatenate
+            if 'pe' in args.embed:
+                norm_y_unsqueezed = norm_y.unsqueeze(1)
+                norm_x_unsqueezed = norm_x.unsqueeze(1)
+                norm_idx_unsqueezed = norm_idx.unsqueeze(1)
+                cur_input = torch.cat([norm_y_unsqueezed, norm_x_unsqueezed, norm_idx_unsqueezed], dim=1)
+            else:
+                cur_input = img_data
+                
             cur_epoch = (epoch + float(i) / len(train_dataloader)) / args.epochs
             lr = adjust_lr(optimizer, cur_epoch, args)
             img_out, _, _ = model(cur_input)
@@ -403,11 +412,24 @@ def evaluate(model, full_dataloader, local_rank, args,
 
         for i, sample in enumerate(full_dataloader):
             img_data, norm_idx, img_idx = data_to_gpu(sample['img'], device), data_to_gpu(sample['norm_idx'], device), data_to_gpu(sample['idx'], device)
+            norm_y, norm_x = data_to_gpu(sample['norm_y'], device), data_to_gpu(sample['norm_x'], device)
+
             if i > 10 and args.debug:
                 break
             img_data, img_gt, inpaint_mask = args.transform_func(img_data)
-            cur_input = norm_idx if 'pe' in args.embed else img_data
+            
+            # 차원 추가 후 concatenate
+            if 'pe' in args.embed:
+                # 각 텐서에 차원 추가
+                norm_y_unsqueezed = norm_y.unsqueeze(1)  # [batch_size] -> [batch_size, 1]
+                norm_x_unsqueezed = norm_x.unsqueeze(1)  # [batch_size] -> [batch_size, 1]
+                norm_idx_unsqueezed = norm_idx.unsqueeze(1)  # [batch_size] -> [batch_size, 1]
+                cur_input = torch.cat([norm_y_unsqueezed, norm_x_unsqueezed, norm_idx_unsqueezed], dim=1)
+            else:
+                cur_input = img_data
+                
             img_out, embed_list, dec_time = cur_model(cur_input, dequant_vid_embed[i] if model_ind else None)
+            
             if model_ind == 0:
                 img_embed_list.append(embed_list[0])
             
