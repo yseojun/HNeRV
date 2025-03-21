@@ -7,8 +7,10 @@ import time
 import pandas as pd
 import numpy as np
 from torchvision.utils import save_image
-from torchvision.io import write_video
+from torchvision.io import write_video, read_image
 from model_all import PositionEncoding
+
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 def dequant_tensor(quant_t):
     quant_t, tmin, scale = quant_t['quant'], quant_t['min'].to(torch.float32), quant_t['scale'].to(torch.float32)
@@ -23,7 +25,7 @@ class VideoRenderer:
         if pe:
             self.pe_embed = PositionEncoding(f'pe_{lbase}_{levels}')
         
-        quant_ckt = torch.load(ckt, map_location='cpu')
+        quant_ckt = torch.load(ckt, map_location='cpu', weights_only=True)
         self.vid_embed = dequant_tensor(quant_ckt['embed']).to(device)
 
         self.frames = self.vid_embed.size(0) // (grid_size * grid_size)
@@ -113,9 +115,142 @@ class VideoRenderer:
         else:
             pe_input = self.get_norm_input(start_x, start_y, end_x, end_y, frames)
             input = self.pe_embed(pe_input)
+
+        if device.startswith('cuda'):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            print("CUDA 타이머 시작")
+
+        if device.startswith('cuda'):
+            start_event.record()
             
         output = self.decoder(input)
+
+        if device.startswith('cuda'):
+            end_event.record()
+            torch.cuda.synchronize()
+            elapsed_time = start_event.elapsed_time(end_event)
+            print(f"GPU 연산 시간: {elapsed_time:.2f} 밀리초")
+        
         return output
+
+    def calculate_psnr(self, img1, img2):
+        mse = torch.mean((img1 - img2) ** 2)
+        if mse == 0:
+            return float('inf')
+        max_pixel = 1.0
+        psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
+        return psnr.item()
+
+    def save_comparison_image(self, real_img, interp_img, save_path):
+        # 이미지를 가로로 나란히 배치
+        comparison = torch.cat([real_img, interp_img], dim=2)  # width 방향으로 연결
+        save_image(comparison, save_path)
+
+    def eval_interpolation(self, data_dir):
+        results = {
+            'x_only': [],
+            'y_only': [],
+            'xy': []
+        }
+        
+        device = next(self.decoder.parameters()).device
+        os.makedirs('interpolation_results', exist_ok=True)
+
+        # x만 interpolation
+        print("X 방향 interpolation 평가 중...")
+        for y in range(8):
+            for x in range(1, 7):
+                # 실제 중간값
+                real_idx = self.calculate_index(y, x, 0)
+                real_embed = self.vid_embed[real_idx]
+                real_img = self.decoder(real_embed.unsqueeze(0))[0]
+                
+                # interpolation
+                left_idx = self.calculate_index(y, x-1, 0)
+                right_idx = self.calculate_index(y, x+1, 0)
+                left_embed = self.vid_embed[left_idx]
+                right_embed = self.vid_embed[right_idx]
+                interp_embed = 0.5 * left_embed + 0.5 * right_embed
+                interp_img = self.decoder(interp_embed.unsqueeze(0))[0]
+                
+                psnr = self.calculate_psnr(real_img, interp_img)
+                results['x_only'].append(psnr)
+                print(f"위치 (y={y}, x={x}): PSNR = {psnr:.2f}dB")
+                
+                # 이미지 저장
+                save_path = f'interpolation_results/x_only_y{y}_x{x}.png'
+                self.save_comparison_image(real_img, interp_img, save_path)
+
+        # y만 interpolation
+        print("\nY 방향 interpolation 평가 중...")
+        for x in range(8):
+            for y in range(1, 7):
+                # 실제 중간값
+                real_idx = self.calculate_index(y, x, 0)
+                real_embed = self.vid_embed[real_idx]
+                real_img = self.decoder(real_embed.unsqueeze(0))[0]
+                
+                # interpolation
+                top_idx = self.calculate_index(y-1, x, 0)
+                bottom_idx = self.calculate_index(y+1, x, 0)
+                top_embed = self.vid_embed[top_idx]
+                bottom_embed = self.vid_embed[bottom_idx]
+                interp_embed = 0.5 * top_embed + 0.5 * bottom_embed
+                interp_img = self.decoder(interp_embed.unsqueeze(0))[0]
+                
+                psnr = self.calculate_psnr(real_img, interp_img)
+                results['y_only'].append(psnr)
+                print(f"위치 (y={y}, x={x}): PSNR = {psnr:.2f}dB")
+                
+                # 이미지 저장
+                save_path = f'interpolation_results/y_only_y{y}_x{x}.png'
+                self.save_comparison_image(real_img, interp_img, save_path)
+
+        # x+y interpolation
+        print("\nX+Y 방향 interpolation 평가 중...")
+        for x in range(1, 7):
+            for y in range(1, 7):
+                # 실제 중간값
+                real_idx = self.calculate_index(y, x, 0)
+                real_embed = self.vid_embed[real_idx]
+                real_img = self.decoder(real_embed.unsqueeze(0))[0]
+                
+                # interpolation
+                tl_idx = self.calculate_index(y-1, x-1, 0)
+                tr_idx = self.calculate_index(y-1, x+1, 0)
+                bl_idx = self.calculate_index(y+1, x-1, 0)
+                br_idx = self.calculate_index(y+1, x+1, 0)
+                
+                tl_embed = self.vid_embed[tl_idx]
+                tr_embed = self.vid_embed[tr_idx]
+                bl_embed = self.vid_embed[bl_idx]
+                br_embed = self.vid_embed[br_idx]
+                
+                interp_embed = 0.25 * (tl_embed + tr_embed + bl_embed + br_embed)
+                interp_img = self.decoder(interp_embed.unsqueeze(0))[0]
+                
+                psnr = self.calculate_psnr(real_img, interp_img)
+                results['xy'].append(psnr)
+                print(f"위치 (y={y}, x={x}): PSNR = {psnr:.2f}dB")
+                
+                # 이미지 저장
+                save_path = f'interpolation_results/xy_y{y}_x{x}.png'
+                self.save_comparison_image(real_img, interp_img, save_path)
+
+        # 결과 출력
+        print("\n=== 최종 결과 ===")
+        for key in results:
+            avg_psnr = np.mean(results[key])
+            min_psnr = np.min(results[key])
+            max_psnr = np.max(results[key])
+            print(f"{key} interpolation:")
+            print(f"  - 평균 PSNR: {avg_psnr:.2f}dB")
+            print(f"  - 최소 PSNR: {min_psnr:.2f}dB")
+            print(f"  - 최대 PSNR: {max_psnr:.2f}dB")
+
+        print(f"\n비교 이미지가 'interpolation_results' 디렉토리에 저장되었습니다.")
+        return results
 
 def main():
     parser = argparse.ArgumentParser()
@@ -127,35 +262,27 @@ def main():
     parser.add_argument('--pe', type=bool, default=False, help='use pe',)
     parser.add_argument('--lbase', type=float, default=2.0, help='base for position encoding',)
     parser.add_argument('--levels', type=int, default=32, help='levels for position encoding',)
+    parser.add_argument('--eval_interpolation', type=bool, default=False, help='evaluate interpolation',)
+    parser.add_argument('--data_dir', type=str, default='', help='data directory for interpolation evaluation',)
     args = parser.parse_args()
     
     if not os.path.exists(args.dump_dir):
         os.makedirs(args.dump_dir)
 
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
     video_renderer = VideoRenderer(args.ckt, args.decoder, args.pe, args.grid_size, device, args.lbase, args.levels)
 
-    if device.startswith('cuda'):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        print("CUDA 타이머 시작")
-
-    if device.startswith('cuda'):
-        start_event.record()
-        
     img_out = video_renderer.render(0, 0, 0, 0, args.frames).cpu()
-    
-    if device.startswith('cuda'):
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_time = start_event.elapsed_time(end_event)
-        print(f"GPU 연산 시간: {elapsed_time:.2f} 밀리초")
 
     out_vid = os.path.join(args.dump_dir, 'nvloader_out.mp4')
     write_video(out_vid, img_out.permute(0,2,3,1) * 255., args.frames/4, options={'crf':'10'})
 
     print(f'dumped video to {out_vid}')
+
+    # interpolation 평가 추가
+    if args.eval_interpolation:
+        print("\n인터폴레이션 평가 시작...")
+        results = video_renderer.eval_interpolation(args.data_dir)
 
 if __name__ == '__main__':
     main()

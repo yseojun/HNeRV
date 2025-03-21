@@ -240,15 +240,12 @@ class PositionEncoding(nn.Module):
 
     def forward(self, pos):
         if 'pe' in self.pe_embed:
-            # pos는 이제 [batch_size, 3] 형태로 들어옵니다 (norm_y, norm_x, norm_idx)
-            # 각 위치 값에 대해 개별적으로 인코딩을 적용합니다
             pe_embeds = []
-            for i in range(pos.size(1)):  # 각 차원(y, x, idx)에 대해 반복
+            for i in range(pos.size(1)):
                 value_list = pos[:, i:i+1] * self.pe_bases.to(pos.device)
                 cur_pe_embed = torch.cat([torch.sin(value_list), torch.cos(value_list)], dim=-1)
                 pe_embeds.append(cur_pe_embed)
             
-            # 모든 인코딩을 합칩니다
             pe_embed = torch.cat(pe_embeds, dim=1)
             return pe_embed.view(pos.size(0), -1, 1, 1)
         else:

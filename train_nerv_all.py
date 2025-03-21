@@ -87,9 +87,11 @@ def main():
     parser.add_argument('--overwrite', action='store_true', help='overwrite the output dir if already exists')
     parser.add_argument('--outf', default='unify', help='folder to output images and model checkpoints')
     parser.add_argument('--suffix', default='', help="suffix str for outf")
+    parser.add_argument('--save_crops', action='store_true', default=False, help='저장된 크롭 이미지를 저장합니다')
 
     # lightfield
     parser.add_argument('--grid_size', default=9)
+    parser.add_argument('--use_lightfield_val', action='store_true', help='라이트필드 구조에 맞춰 (2,4,6) 그리드 위치를 validation set으로 사용')
 
 
     args = parser.parse_args()
@@ -160,8 +162,29 @@ def train(local_rank, args):
             num_workers=args.workers, pin_memory=True, sampler=sampler, drop_last=False, worker_init_fn=worker_init_fn)
     args.final_size = full_dataset.final_size
     args.full_data_length = len(full_dataset)
-    split_num_list = [int(x) for x in args.data_split.split('_')]
-    train_ind_list, args.val_ind_list = data_split(list(range(args.full_data_length)), split_num_list, args.shuffle_data, 0)
+    
+    # Lightfield 구조에 맞춰 validation 인덱스 설정
+    if args.use_lightfield_val and hasattr(args, 'grid_size') and args.grid_size > 0:
+        # 라이트필드 validation 인덱스 설정 (2,4,6 그리드 위치)
+        args.val_ind_list = []
+        frame_num = full_dataset.frame_num if hasattr(full_dataset, 'frame_num') else args.full_data_length // (args.grid_size * args.grid_size)
+        
+        for yy in range(2, 6+1, 2):  # yy = 2, 4, 6
+            for xx in range(2, 6+1, 2):  # xx = 2, 4, 6
+                for tt in range(0, frame_num):
+                    val_i = (yy*args.grid_size + xx)*frame_num + tt
+                    if val_i < args.full_data_length:  # 인덱스 범위 체크
+                        args.val_ind_list.append(val_i)
+        
+        print(f"Lightfield validation: {len(args.val_ind_list)} 프레임을 validation set으로 설정합니다.")
+        
+        # Training 인덱스: validation 인덱스를 제외한 모든 인덱스
+        train_ind_list = [i for i in range(args.full_data_length) if i not in args.val_ind_list]
+    else:
+        # 기존 방식대로 data_split 함수 사용
+        split_num_list = [int(x) for x in args.data_split.split('_')]
+        train_ind_list, args.val_ind_list = data_split(list(range(args.full_data_length)), split_num_list, args.shuffle_data, 0)
+    
     args.dump_vis = (args.dump_images or args.dump_videos)
 
     #  Make sure the testing dataset is fixed for every run
@@ -182,7 +205,7 @@ def train(local_rank, args):
         embed_dim = int(embed_ratio * args.modelsize * 1e6 / args.full_data_length / embed_hw) if embed_ratio < 1 else int(embed_ratio) 
         embed_param = float(embed_dim) / total_enc_strds**2 * args.final_size * args.full_data_length
         args.enc_dim = f'{int(enc_dim1)}_{embed_dim}' 
-        fc_param = (np.prod(args.enc_strds) // np.prod(args.dec_strds))**2 * 9
+        fc_param = (np.prod(args.enc_strds) // np.prod(args.dec_strds)) ** 2 * 9
 
     decoder_size = args.modelsize * 1e6 - embed_param
     ch_reduce = 1. / args.reduce
@@ -258,7 +281,16 @@ def train(local_rank, args):
 
     if args.eval_only:
         print_str = 'Evaluation ... \n {} Results for checkpoint: {}\n'.format(datetime.now().strftime('%Y_%m_%d_%H_%M_%S'), args.weight)
-        results_list, hw = evaluate(model, full_dataloader, local_rank, args, args.dump_vis, huffman_coding=True)
+        
+        # validation 데이터셋만 사용하는 dataloader 생성
+        val_dataset = Subset(full_dataset, args.val_ind_list)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset) if args.distributed else None
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batchSize, shuffle=False,
+                num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False, worker_init_fn=worker_init_fn)
+        
+        print(f"Validation dataset size: {len(val_dataset)} 프레임으로 평가합니다.")
+        results_list, hw = evaluate(model, val_dataloader, local_rank, args, args.dump_vis, huffman_coding=True)
+        
         print_str = f'PSNR for output {hw} for quant {args.quant_str}: '
         for i, (metric_name, best_metric_value, metric_value) in enumerate(zip(args.metric_names, best_metric_list, results_list)):
             best_metric_value = best_metric_value if best_metric_value > metric_value.max() else metric_value.max()
@@ -445,7 +477,11 @@ def evaluate(model, full_dataloader, local_rank, args,
             pred_psnr, pred_ssim = psnr_fn_batch([img_out], img_gt), msssim_fn_batch([img_out], img_gt)
             for metric_idx, cur_v in  enumerate([pred_psnr, pred_ssim]):
                 for batch_i, cur_img_idx in enumerate(img_idx):
-                    metric_idx_start = 2 if cur_img_idx in args.val_ind_list else 0
+                    # 이미 validation 데이터셋만 있는 경우 항상 unseen 메트릭을 사용
+                    if 'val_dataloader' in str(full_dataloader):
+                        metric_idx_start = 2
+                    else:
+                        metric_idx_start = 2 if cur_img_idx in args.val_ind_list else 0
                     metric_list[metric_idx_start+metric_idx+4*model_ind].append(cur_v[:,batch_i])
 
             # dump predictions
